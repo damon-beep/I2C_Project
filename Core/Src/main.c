@@ -26,6 +26,7 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,6 +58,14 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* ----- WF100D sensor (single device, no mux) ----- */
+#define WF100D_ADDR8   (0x6D << 1)   /* 8-bit I2C address */
+#define WF_REG_STATUS  0x02          /* bit0 = DRDY */
+#define WF_REG_DATA    0x06          /* 0x06..0x08 : 24-bit pressure */
+#define WF_REG_TEMP    0x09          /* 0x09..0x0A : 16-bit temperature */
+#define WF_REG_CMD     0x30          /* bit3 = Sco, bits2:0 = measurement mode */
+#define WF_CMD_START   0x0A          /* combined conversion (010) + Sco (1<<3) */
+#define WF_STATUS_DRDY 0x01
 
 /* Send a null-terminated string over the ST-Link VCP (USART2). */
 static void uart_print(const char *s)
@@ -64,30 +73,49 @@ static void uart_print(const char *s)
   HAL_UART_Transmit(&huart2, (uint8_t *)s, strlen(s), HAL_MAX_DELAY);
 }
 
-/* Sweep the 7-bit address space and print every device that ACKs. */
-static void i2c_scan(void)
+/* Read one measurement (pressure + temperature) from the sensor.
+ * Returns HAL_OK on success; *p_raw is sign-extended 24-bit pressure,
+ * *t_raw is signed 16-bit temperature (LSB = 1/256 C). */
+static HAL_StatusTypeDef wf100d_read(int32_t *p_raw, int16_t *t_raw)
 {
-  char line[48];
-  uint8_t found = 0;
+  uint8_t cmd = WF_CMD_START;
+  uint8_t status;
+  uint8_t buf[5];
 
-  uart_print("\r\nI2C scan:\r\n");
-
-  for (uint8_t addr = 1; addr < 128; addr++)
+  /* Start a conversion. */
+  if (HAL_I2C_Mem_Write(&hi2c1, WF100D_ADDR8, WF_REG_CMD,
+                        I2C_MEMADD_SIZE_8BIT, &cmd, 1, 100) != HAL_OK)
   {
-    /* HAL takes the 8-bit (left-shifted) address. */
-    if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr << 1), 3, 10) == HAL_OK)
+    return HAL_ERROR;
+  }
+
+  /* Poll DRDY (bit0 of Status) with a timeout. */
+  uint32_t start = HAL_GetTick();
+  do
+  {
+    if (HAL_GetTick() - start > 100) return HAL_TIMEOUT;
+    if (HAL_I2C_Mem_Read(&hi2c1, WF100D_ADDR8, WF_REG_STATUS,
+                         I2C_MEMADD_SIZE_8BIT, &status, 1, 100) != HAL_OK)
     {
-      snprintf(line, sizeof(line), "  found device at 0x%02X\r\n", addr);
-      uart_print(line);
-      found++;
+      return HAL_ERROR;
     }
+  } while ((status & WF_STATUS_DRDY) == 0);
+
+  /* Read 24-bit pressure (0x06..0x08) and 16-bit temperature (0x09..0x0A). */
+  if (HAL_I2C_Mem_Read(&hi2c1, WF100D_ADDR8, WF_REG_DATA,
+                       I2C_MEMADD_SIZE_8BIT, buf, 3, 100) != HAL_OK ||
+      HAL_I2C_Mem_Read(&hi2c1, WF100D_ADDR8, WF_REG_TEMP,
+                       I2C_MEMADD_SIZE_8BIT, &buf[3], 2, 100) != HAL_OK)
+  {
+    return HAL_ERROR;
   }
 
-  if (found == 0)
-  {
-    uart_print("  no devices found\r\n");
-  }
-  uart_print("scan done.\r\n");
+  int32_t p = ((int32_t)buf[0] << 16) | ((int32_t)buf[1] << 8) | buf[2];
+  if (p & 0x800000) p |= 0xFF000000;          /* sign-extend 24 -> 32 */
+  *p_raw = p;
+  *t_raw = (int16_t)((buf[3] << 8) | buf[4]);  /* signed 16-bit */
+
+  return HAL_OK;
 }
 
 /* USER CODE END 0 */
@@ -124,7 +152,7 @@ int main(void)
   MX_I2C1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  uart_print("\r\n=== NUCLEO-F303K8 I2C scanner ===\r\n");
+  uart_print("\r\n=== WF100D sensor read ===\r\n");
 
   /* USER CODE END 2 */
 
@@ -135,8 +163,28 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    i2c_scan();
-    HAL_Delay(1000);
+    int32_t p_raw;
+    int16_t t_raw;
+    char line[64];
+
+    if (wf100d_read(&p_raw, &t_raw) == HAL_OK)
+    {
+      /* Fixed-point print (no float): pressure = raw/64, temp = raw/256 C. */
+      long p_centi = (long)p_raw * 100 / 64;
+      long t_centi = (long)t_raw * 100 / 256;
+      snprintf(line, sizeof(line),
+               "P=%ld (%s%ld.%02ld)  T=%s%ld.%02ld C\r\n",
+               (long)p_raw,
+               p_centi < 0 ? "-" : "", labs(p_centi) / 100, labs(p_centi) % 100,
+               t_centi < 0 ? "-" : "", labs(t_centi) / 100, labs(t_centi) % 100);
+      uart_print(line);
+    }
+    else
+    {
+      uart_print("read error\r\n");
+    }
+
+    HAL_Delay(500);
   }
   /* USER CODE END 3 */
 }
