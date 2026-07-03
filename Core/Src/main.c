@@ -59,13 +59,22 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 /* ----- WF100D sensor (single device, no mux) ----- */
-#define WF100D_ADDR8   (0x6D << 1)   /* 8-bit I2C address */
-#define WF_REG_STATUS  0x02          /* bit0 = DRDY */
-#define WF_REG_DATA    0x06          /* 0x06..0x08 : 24-bit pressure */
-#define WF_REG_TEMP    0x09          /* 0x09..0x0A : 16-bit temperature */
-#define WF_REG_CMD     0x30          /* bit3 = Sco, bits2:0 = measurement mode */
-#define WF_CMD_START   0x0A          /* combined conversion (010) + Sco (1<<3) */
-#define WF_STATUS_DRDY 0x01
+#define WF100D_ADDR8      (0x6D << 1) /* 8-bit I2C address */
+#define WF_REG_SPI_CTRL   0x00        /* soft reset */
+#define WF_REG_STATUS     0x02        /* bit0 = DRDY */
+#define WF_REG_DATA       0x06        /* 0x06..0x08 : 24-bit pressure */
+#define WF_REG_TEMP       0x09        /* 0x09..0x0A : 16-bit temperature */
+#define WF_REG_CMD        0x30        /* bit3 = Sco, bits2:0 = measurement mode */
+#define WF_CMD_START      0x0A        /* combined conversion (010) + Sco (1<<3) */
+#define WF_CMD_SOFT_RESET 0x24        /* Soft_reset: sets bits 5 and 2, auto-clears */
+#define WF_STATUS_DRDY    0x01
+
+/* Pressure transfer function (from Adafruit_WF100DPZ, tunable for the 200 kPa
+ * gauge part):  pressure_kPa = (signed_raw / 2^23) * SCALE + OFFSET
+ * Constants held in centi-kPa (x100) so the conversion stays integer-only. */
+#define WF_P_DIV       8388608LL      /* 2^23 */
+#define WF_P_SCALE_C   25000LL        /* 250.00 kPa */
+#define WF_P_OFFSET_C  2500LL         /*  25.00 kPa */
 
 /* Send a null-terminated string over the ST-Link VCP (USART2). */
 static void uart_print(const char *s)
@@ -73,16 +82,22 @@ static void uart_print(const char *s)
   HAL_UART_Transmit(&huart2, (uint8_t *)s, strlen(s), HAL_MAX_DELAY);
 }
 
+/* DIAG: which stage the last read reached. 1=CMD write, 2=STATUS poll,
+ * 3=DATA read. Set as the read progresses so a failure pinpoints the stage. */
+static uint8_t g_wf_stage;
+static uint8_t g_wf_status;   /* last STATUS byte read */
+
 /* Read one measurement (pressure + temperature) from the sensor.
  * Returns HAL_OK on success; *p_raw is sign-extended 24-bit pressure,
  * *t_raw is signed 16-bit temperature (LSB = 1/256 C). */
 static HAL_StatusTypeDef wf100d_read(int32_t *p_raw, int16_t *t_raw)
 {
   uint8_t cmd = WF_CMD_START;
-  uint8_t status;
+  uint8_t status = 0;
   uint8_t buf[5];
 
   /* Start a conversion. */
+  g_wf_stage = 1;
   if (HAL_I2C_Mem_Write(&hi2c1, WF100D_ADDR8, WF_REG_CMD,
                         I2C_MEMADD_SIZE_8BIT, &cmd, 1, 100) != HAL_OK)
   {
@@ -90,16 +105,20 @@ static HAL_StatusTypeDef wf100d_read(int32_t *p_raw, int16_t *t_raw)
   }
 
   /* Poll DRDY (bit0 of Status) with a timeout. */
+  g_wf_stage = 2;
   uint32_t start = HAL_GetTick();
   do
   {
-    if (HAL_GetTick() - start > 100) return HAL_TIMEOUT;
+    if (HAL_GetTick() - start > 100) { g_wf_status = status; return HAL_TIMEOUT; }
     if (HAL_I2C_Mem_Read(&hi2c1, WF100D_ADDR8, WF_REG_STATUS,
                          I2C_MEMADD_SIZE_8BIT, &status, 1, 100) != HAL_OK)
     {
       return HAL_ERROR;
     }
+    g_wf_status = status;
   } while ((status & WF_STATUS_DRDY) == 0);
+
+  g_wf_stage = 3;
 
   /* Read 24-bit pressure (0x06..0x08) and 16-bit temperature (0x09..0x0A). */
   if (HAL_I2C_Mem_Read(&hi2c1, WF100D_ADDR8, WF_REG_DATA,
@@ -154,6 +173,16 @@ int main(void)
   /* USER CODE BEGIN 2 */
   uart_print("\r\n=== WF100D sensor read ===\r\n");
 
+  /* DIAG: does the sensor ACK its address at all? */
+  {
+    char dbg[80];
+    HAL_StatusTypeDef rdy = HAL_I2C_IsDeviceReady(&hi2c1, WF100D_ADDR8, 3, 100);
+    snprintf(dbg, sizeof(dbg), "probe addr 0x%02X: rdy=%d halerr=0x%08lX\r\n",
+             (WF100D_ADDR8 >> 1), (int)rdy,
+             (unsigned long)HAL_I2C_GetError(&hi2c1));
+    uart_print(dbg);
+  }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -165,23 +194,29 @@ int main(void)
     /* USER CODE BEGIN 3 */
     int32_t p_raw;
     int16_t t_raw;
-    char line[64];
+    char line[80];
 
     if (wf100d_read(&p_raw, &t_raw) == HAL_OK)
     {
-      /* Fixed-point print (no float): pressure = raw/64, temp = raw/256 C. */
-      long p_centi = (long)p_raw * 100 / 64;
+      /* Fixed-point print (no float). Pressure via the affine transfer
+       * function in centi-kPa; temperature = raw/256 C. */
+      long p_ckpa = (long)((int64_t)p_raw * WF_P_SCALE_C / WF_P_DIV + WF_P_OFFSET_C);
       long t_centi = (long)t_raw * 100 / 256;
       snprintf(line, sizeof(line),
-               "P=%ld (%s%ld.%02ld)  T=%s%ld.%02ld C\r\n",
+               "P=%s%ld.%02ld kPa (raw %ld)  T=%s%ld.%02ld C\r\n",
+               p_ckpa < 0 ? "-" : "", labs(p_ckpa) / 100, labs(p_ckpa) % 100,
                (long)p_raw,
-               p_centi < 0 ? "-" : "", labs(p_centi) / 100, labs(p_centi) % 100,
                t_centi < 0 ? "-" : "", labs(t_centi) / 100, labs(t_centi) % 100);
       uart_print(line);
     }
     else
     {
-      uart_print("read error\r\n");
+      char dbg[80];
+      snprintf(dbg, sizeof(dbg),
+               "read error: stage=%u status=0x%02X halerr=0x%08lX\r\n",
+               g_wf_stage, g_wf_status,
+               (unsigned long)HAL_I2C_GetError(&hi2c1));
+      uart_print(dbg);
     }
 
     HAL_Delay(500);
