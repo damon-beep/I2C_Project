@@ -19,7 +19,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "i2c.h"
-#include "spi.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -60,29 +59,9 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* ----- WF100D sensor (single device, 3-wire half-duplex SPI) -----
- * CSB is tied to GND, so the STM32 does not drive a chip-select (NSS is
- * software). Register access frames a command byte then data on one line.
- *
- * ASSUMPTION (not in the datasheet pages I have): the command byte carries
- * the register address in bits[6:0], with bit7 = 1 for READ, 0 for WRITE.
- * If reads return garbage, flip WF_SPI_READ (try 0x00) or the SPI mode in
- * spi.c (SPI_PHASE_2EDGE / SPI_POLARITY_HIGH = mode 3). */
-#define WF_SPI_READ       0x80        /* OR into reg addr to request a read */
-
-/* Chip-select. 3-wire SPI needs CS to toggle per transaction, so CSB must be
- * wired to this GPIO (NOT tied to GND). Pick any free pin; PA4 is unused. */
-#define WF_IO_PORT        GPIOA
-#define WF_CS_PIN         GPIO_PIN_4    /* PA4  chip select      */
-#define WF_SCK_PIN        GPIO_PIN_5    /* PA5  clock            */
-#define WF_SDIO_PIN       GPIO_PIN_7    /* PA7  bidir data       */
-#define WF_CS_LOW()       HAL_GPIO_WritePin(WF_IO_PORT, WF_CS_PIN, GPIO_PIN_RESET)
-#define WF_CS_HIGH()      HAL_GPIO_WritePin(WF_IO_PORT, WF_CS_PIN, GPIO_PIN_SET)
-#define WF_SCK_HIGH()     HAL_GPIO_WritePin(WF_IO_PORT, WF_SCK_PIN, GPIO_PIN_SET)
-#define WF_SCK_LOW()      HAL_GPIO_WritePin(WF_IO_PORT, WF_SCK_PIN, GPIO_PIN_RESET)
-
+/* ----- WF100D sensor (single device, no mux) ----- */
+#define WF100D_ADDR8      (0x6D << 1) /* 8-bit I2C address */
 #define WF_REG_SPI_CTRL   0x00        /* soft reset */
-#define WF_REG_PART_ID    0x01        /* OTP part id (non-zero) -> link check */
 #define WF_REG_STATUS     0x02        /* bit0 = DRDY */
 #define WF_REG_DATA       0x06        /* 0x06..0x08 : 24-bit pressure */
 #define WF_REG_TEMP       0x09        /* 0x09..0x0A : 16-bit temperature */
@@ -104,81 +83,18 @@ static void uart_print(const char *s)
   HAL_UART_Transmit(&huart2, (uint8_t *)s, strlen(s), HAL_MAX_DELAY);
 }
 
-/* Write one register: command byte (reg, write) followed by the value.
- * Half-duplex, so a single transmit of both bytes. */
-/* --- Bit-banged 3-wire SPI, mode 0 (CPOL=0/CPHA=0), MSB first, on the same
- * pins as SPI1 (PA5=SCK, PA7=SDIO). Gives exact control of the clock count and
- * line turnaround, avoiding the HAL 1-line half-duplex over-run. --- */
-
-/* Set the bidirectional data pin to output or input. */
-static void sdio_dir(uint32_t mode)   /* GPIO_MODE_OUTPUT_PP | GPIO_MODE_INPUT */
-{
-  GPIO_InitTypeDef g = {0};
-  g.Pin = WF_SDIO_PIN;
-  g.Mode = mode;
-  g.Pull = GPIO_NOPULL;
-  g.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(WF_IO_PORT, &g);
-}
-
-/* Clock one byte out (data set while clock low, sampled by slave on rising). */
-static void spi_out_byte(uint8_t b)
-{
-  for (int i = 7; i >= 0; i--)
-  {
-    HAL_GPIO_WritePin(WF_IO_PORT, WF_SDIO_PIN,
-                      (b & (1 << i)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    WF_SCK_HIGH();
-    WF_SCK_LOW();
-  }
-}
-
-/* Clock one byte in (sampled on the rising edge, MSB first). */
-static uint8_t spi_in_byte(void)
-{
-  uint8_t b = 0;
-  for (int i = 7; i >= 0; i--)
-  {
-    WF_SCK_HIGH();
-    if (HAL_GPIO_ReadPin(WF_IO_PORT, WF_SDIO_PIN) == GPIO_PIN_SET) b |= (1 << i);
-    WF_SCK_LOW();
-  }
-  return b;
-}
-
-static HAL_StatusTypeDef wf_write_reg(uint8_t reg, uint8_t val)
-{
-  WF_CS_LOW();
-  sdio_dir(GPIO_MODE_OUTPUT_PP);
-  spi_out_byte((uint8_t)(reg & 0x7F));
-  spi_out_byte(val);
-  WF_CS_HIGH();
-  return HAL_OK;
-}
-
-/* Send the read command byte, turn the line around, then clock in n bytes,
- * all inside one CS-low frame. */
-static HAL_StatusTypeDef wf_read_regs(uint8_t reg, uint8_t *buf, uint16_t n)
-{
-  WF_CS_LOW();
-  sdio_dir(GPIO_MODE_OUTPUT_PP);
-  spi_out_byte((uint8_t)(reg | WF_SPI_READ));
-  sdio_dir(GPIO_MODE_INPUT);
-  for (uint16_t k = 0; k < n; k++) buf[k] = spi_in_byte();
-  WF_CS_HIGH();
-  return HAL_OK;
-}
-
 /* Read one measurement (pressure + temperature) from the sensor.
  * Returns HAL_OK on success; *p_raw is sign-extended 24-bit pressure,
  * *t_raw is signed 16-bit temperature (LSB = 1/256 C). */
 static HAL_StatusTypeDef wf100d_read(int32_t *p_raw, int16_t *t_raw)
 {
+  uint8_t cmd = WF_CMD_START;
   uint8_t status;
   uint8_t buf[5];
 
   /* Start a conversion. */
-  if (wf_write_reg(WF_REG_CMD, WF_CMD_START) != HAL_OK)
+  if (HAL_I2C_Mem_Write(&hi2c1, WF100D_ADDR8, WF_REG_CMD,
+                        I2C_MEMADD_SIZE_8BIT, &cmd, 1, 100) != HAL_OK)
   {
     return HAL_ERROR;
   }
@@ -188,15 +104,18 @@ static HAL_StatusTypeDef wf100d_read(int32_t *p_raw, int16_t *t_raw)
   do
   {
     if (HAL_GetTick() - start > 100) return HAL_TIMEOUT;
-    if (wf_read_regs(WF_REG_STATUS, &status, 1) != HAL_OK)
+    if (HAL_I2C_Mem_Read(&hi2c1, WF100D_ADDR8, WF_REG_STATUS,
+                         I2C_MEMADD_SIZE_8BIT, &status, 1, 100) != HAL_OK)
     {
       return HAL_ERROR;
     }
   } while ((status & WF_STATUS_DRDY) == 0);
 
   /* Read 24-bit pressure (0x06..0x08) and 16-bit temperature (0x09..0x0A). */
-  if (wf_read_regs(WF_REG_DATA, buf, 3) != HAL_OK ||
-      wf_read_regs(WF_REG_TEMP, &buf[3], 2) != HAL_OK)
+  if (HAL_I2C_Mem_Read(&hi2c1, WF100D_ADDR8, WF_REG_DATA,
+                       I2C_MEMADD_SIZE_8BIT, buf, 3, 100) != HAL_OK ||
+      HAL_I2C_Mem_Read(&hi2c1, WF100D_ADDR8, WF_REG_TEMP,
+                       I2C_MEMADD_SIZE_8BIT, &buf[3], 2, 100) != HAL_OK)
   {
     return HAL_ERROR;
   }
@@ -242,32 +161,14 @@ int main(void)
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_USART2_UART_Init();
-  /* SPI1 peripheral not used: the sensor is driven by bit-banged 3-wire SPI
-   * on PA5/PA7/PA4 (see USER CODE below), which avoids the HAL 1-line
-   * half-duplex over-run. */
   /* USER CODE BEGIN 2 */
-  uart_print("\r\n=== WF100D sensor read (SPI) ===\r\n");
+  uart_print("\r\n=== WF100D sensor read ===\r\n");
 
-  /* Configure the bit-bang SPI GPIOs: PA4=CS, PA5=SCK, PA7=SDIO (all outputs
-   * to start; SDIO is flipped to input during reads). Idle CS high, SCK low. */
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  GPIO_InitTypeDef io = {0};
-  io.Pin = WF_CS_PIN | WF_SCK_PIN | WF_SDIO_PIN;
-  io.Mode = GPIO_MODE_OUTPUT_PP;
-  io.Pull = GPIO_NOPULL;
-  io.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(WF_IO_PORT, &io);
-  WF_CS_HIGH();
-  WF_SCK_LOW();
-
-  /* DIAGNOSTIC: no writes at all -- isolate the read path. If PART_ID reads
-   * 0x87 here (and in the loop), bit-bang reads work and the earlier soft-reset
-   * write was corrupting SPI_Ctrl. */
-  uint8_t pid = 0;
-  char idline[32];
-  wf_read_regs(WF_REG_PART_ID, &pid, 1);
-  snprintf(idline, sizeof(idline), "PART_ID = 0x%02X (read-only test)\r\n", pid);
-  uart_print(idline);
+  /* Soft reset so the sensor starts from a known state. */
+  uint8_t rst = WF_CMD_SOFT_RESET;
+  HAL_I2C_Mem_Write(&hi2c1, WF100D_ADDR8, WF_REG_SPI_CTRL,
+                    I2C_MEMADD_SIZE_8BIT, &rst, 1, 100);
+  HAL_Delay(10);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -277,17 +178,27 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* DIAGNOSTIC: read-only. No writes anywhere. Read PART_ID twice and STATUS
-     * to see if bit-bang reads are stable on their own. */
-    uint8_t pid1 = 0, pid2 = 0, st = 0;
-    char line[64];
+    int32_t p_raw;
+    int16_t t_raw;
+    char line[80];
 
-    wf_read_regs(WF_REG_PART_ID, &pid1, 1);
-    wf_read_regs(WF_REG_PART_ID, &pid2, 1);
-    wf_read_regs(WF_REG_STATUS, &st, 1);
-
-    snprintf(line, sizeof(line), "PID=%02X PID=%02X ST=%02X\r\n", pid1, pid2, st);
-    uart_print(line);
+    if (wf100d_read(&p_raw, &t_raw) == HAL_OK)
+    {
+      /* Fixed-point print (no float). Pressure via the affine transfer
+       * function in centi-kPa; temperature = raw/256 C. */
+      long p_ckpa = (long)((int64_t)p_raw * WF_P_SCALE_C / WF_P_DIV + WF_P_OFFSET_C);
+      long t_centi = (long)t_raw * 100 / 256;
+      snprintf(line, sizeof(line),
+               "P=%s%ld.%02ld kPa (raw %ld)  T=%s%ld.%02ld C\r\n",
+               p_ckpa < 0 ? "-" : "", labs(p_ckpa) / 100, labs(p_ckpa) % 100,
+               (long)p_raw,
+               t_centi < 0 ? "-" : "", labs(t_centi) / 100, labs(t_centi) % 100);
+      uart_print(line);
+    }
+    else
+    {
+      uart_print("read error\r\n");
+    }
 
     HAL_Delay(500);
   }
